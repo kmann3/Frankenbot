@@ -6,8 +6,6 @@ edition = "2024"
 [dependencies]
 chrono = "0.4.45"
 dotenvy = "0.15.7"
-genpdf = { version = "0.2.0", features = ["images"] }
-image = { version = "0.23.14", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 regex = "1.13.1"
 reqwest = { version = "0.13.5", features = ["rustls"] }
 scraper = "0.27.0"

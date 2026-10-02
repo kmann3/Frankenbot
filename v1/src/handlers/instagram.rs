@@ -46,10 +46,10 @@ pub async fn handle_message(ctx: &Context, msg: &Message) {
                     }
                 }
 
-                if let Some(first_path) = media_paths.first() {
-                    if let Err(error) = instagram::cleanup_download(first_path).await {
-                        eprintln!("Instagram cleanup failed: {error}");
-                    }
+                if let Some(first_path) = media_paths.first()
+                    && let Err(error) = instagram::cleanup_download(first_path).await
+                {
+                    eprintln!("Instagram cleanup failed: {error}");
                 }
             }
 

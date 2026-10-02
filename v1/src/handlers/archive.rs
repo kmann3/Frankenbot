@@ -8,7 +8,6 @@ use std::{
 };
 
 use chrono::{DateTime, Local, Utc};
-use genpdf::{Element as _, elements, fonts, style};
 use regex::Regex;
 use reqwest::{Client, Url};
 use serenity::{
@@ -35,25 +34,9 @@ type BoxError = Box<dyn Error + Send + Sync>;
 
 const ARCHIVE_ROOT: &str = "archives";
 const SAFE_UPLOAD_LIMIT: u64 = 24 * 1024 * 1024;
-const MAX_PDF_JOB_SIZE: u64 = 100 * 1024 * 1024;
 
 static USER_MENTION_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<@!?(\d+)>").expect("user mention regex should compile"));
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ArchiveFormat {
-    Html,
-    Pdf,
-}
-
-impl ArchiveFormat {
-    fn extension(self) -> &'static str {
-        match self {
-            Self::Html => "html",
-            Self::Pdf => "pdf",
-        }
-    }
-}
 
 #[derive(Debug)]
 struct ArchiveSelection {
@@ -110,7 +93,7 @@ struct MessageArchiveState<'a> {
 
 pub fn command() -> CreateCommand {
     CreateCommand::new("archive")
-        .description("Archive a text/voice channel or all supported channels in a category")
+        .description("Archive a text/voice channel or category as HTML with resources in a ZIP")
         .default_member_permissions(Permissions::MANAGE_CHANNELS)
         .dm_permission(false)
         .add_option(
@@ -125,16 +108,6 @@ pub fn command() -> CreateCommand {
                 ChannelType::Voice,
                 ChannelType::Category,
             ])
-            .required(true),
-        )
-        .add_option(
-            CreateCommandOption::new(
-                CommandOptionType::String,
-                "format",
-                "The archive file format",
-            )
-            .add_string_choice("HTML", "html")
-            .add_string_choice("PDF", "pdf")
             .required(true),
         )
 }
@@ -182,9 +155,6 @@ async fn run(ctx: &Context, interaction: &CommandInteraction) -> Result<(), BoxE
 
     let target_id = option_channel_id(interaction, "target")
         .ok_or("The target channel or category was not provided.")?;
-    let format = option_string(interaction, "format")
-        .and_then(parse_format)
-        .ok_or("The format must be HTML or PDF.")?;
 
     interaction
         .create_response(
@@ -231,9 +201,6 @@ async fn run(ctx: &Context, interaction: &CommandInteraction) -> Result<(), BoxE
     let mut author_colours = HashMap::new();
     let mut display_names = HashMap::new();
     let mut used_asset_filenames = HashSet::new();
-    let mut estimated_pdf_size = 0_u64;
-    let mut actual_pdf_size = 0_u64;
-    let mut pdf_warning_sent = false;
     let mut unavailable_resource_count = 0_usize;
 
     for channel in selection.channels {
@@ -250,80 +217,10 @@ async fn run(ctx: &Context, interaction: &CommandInteraction) -> Result<(), BoxE
         let messages = fetch_all_messages(channel.id, &mut message_archive_state).await?;
         unavailable_resource_count =
             unavailable_resource_count.saturating_add(count_unavailable_resources(&messages));
-        if format == ArchiveFormat::Pdf {
-            estimated_pdf_size = estimated_pdf_size.saturating_add(estimate_pdf_size(&messages));
-            if pdf_job_too_large(estimated_pdf_size) {
-                remove_canceled_archive(&output_dir).await;
-                println!(
-                    "Archive for {requested_target}, requested by {requested_by}, canceled. Estimated file size: {:.2} MiB",
-                    mib(estimated_pdf_size)
-                );
-                interaction
-                    .edit_response(
-                        &ctx.http,
-                        EditInteractionResponse::new().content(personalized_response(
-                            requested_by,
-                            &format!(
-                                "The PDF archive is estimated at {:.2} MiB, exceeding the 100 MiB maximum. **The archive job was canceled.** Please run `/archive` again with format `HTML`.",
-                                mib(estimated_pdf_size),
-                            ),
-                        )),
-                    )
-                    .await?;
-                return Ok(());
-            }
-            if estimated_pdf_size >= upload_limit && !pdf_warning_sent {
-                interaction
-                    .edit_response(
-                        &ctx.http,
-                        EditInteractionResponse::new().content(personalized_response(
-                            requested_by,
-                            &format!(
-                                "This PDF is estimated at approximately {:.2} MiB, above my {:.2} MiB Discord upload limit. **HTML is strongly recommended** because the channel document is usually smaller. Resources are stored as separate files in the ZIP for either format. I’ll continue creating the PDF you requested.",
-                                mib(estimated_pdf_size),
-                                mib(upload_limit),
-                            ),
-                        )),
-                    )
-                    .await?;
-                pdf_warning_sent = true;
-            }
-        }
-        let filename = format!(
-            "{}.{}",
-            archive_channel_basename(&channel),
-            format.extension()
-        );
-        let path = content_dir.join(filename);
-
+        let path = content_dir.join(format!("{}.html", archive_channel_basename(&channel)));
         bundle_files.extend(archived_resource_paths(&messages));
-        match format {
-            ArchiveFormat::Html => write_html(&path, &channel, &messages).await?,
-            ArchiveFormat::Pdf => write_pdf(&path, &channel, messages).await?,
-        }
-
-        let size = tokio::fs::metadata(&path).await?.len();
-        if format == ArchiveFormat::Pdf {
-            actual_pdf_size = actual_pdf_size.saturating_add(size);
-            if pdf_job_too_large(actual_pdf_size) {
-                remove_canceled_archive(&output_dir).await;
-                println!(
-                    "Archive for {requested_target}, requested by {requested_by}, canceled. Actual file size exceeded {:.2} MiB",
-                    mib(MAX_PDF_JOB_SIZE)
-                );
-                interaction
-                    .edit_response(
-                        &ctx.http,
-                        EditInteractionResponse::new().content(personalized_response(
-                            requested_by,
-                            "The generated PDF archive exceeded the 100 MiB maximum. **The archive job was canceled.** Please run `/archive` again with format `HTML`.",
-                        )),
-                    )
-                    .await?;
-                return Ok(());
-            }
-        }
-        bundle_files.push(path.clone());
+        write_html(&path, &channel, &messages).await?;
+        bundle_files.push(path);
     }
 
     let zip_path = output_dir.join(archive_zip_filename(
@@ -348,19 +245,13 @@ async fn run(ctx: &Context, interaction: &CommandInteraction) -> Result<(), BoxE
         .iter()
         .filter(|(_, size)| *size < upload_limit)
         .collect::<Vec<_>>();
-    let html_recommended = format == ArchiveFormat::Pdf
-        && (estimated_pdf_size >= upload_limit || !oversized.is_empty());
-
     let mut summary = if is_category {
         format!(
-            "Created one ZIP archive containing {archived_channel_count} individual {} channel files.",
-            format.extension().to_uppercase()
+            "Created one ZIP archive containing {archived_channel_count} individual HTML channel files and their referenced resource files."
         )
     } else {
-        format!(
-            "Created one ZIP archive containing the {} channel file and its referenced resource files.",
-            format.extension().to_uppercase()
-        )
+        "Created one ZIP archive containing the HTML channel file and its referenced resource files."
+            .to_string()
     };
     if !oversized.is_empty() {
         let names = oversized
@@ -381,12 +272,6 @@ async fn run(ctx: &Context, interaction: &CommandInteraction) -> Result<(), BoxE
             if oversized.len() == 1 { "s" } else { "" },
             if oversized.len() == 1 { "has" } else { "have" },
             if oversized.len() == 1 { "it" } else { "them" },
-        )?;
-    }
-    if html_recommended {
-        write!(
-            summary,
-            " **HTML is strongly recommended for this archive.** Run `/archive` again with format `HTML`; its channel document is usually smaller. Resources are stored as separate files in the ZIP for either format."
         )?;
     }
     if unavailable_resource_count > 0 {
@@ -482,25 +367,6 @@ fn option_channel_id(interaction: &CommandInteraction, name: &str) -> Option<Cha
                 _ => None,
             })
     })
-}
-
-fn option_string<'a>(interaction: &'a CommandInteraction, name: &str) -> Option<&'a str> {
-    interaction.data.options.iter().find_map(|option| {
-        (option.name == name)
-            .then_some(&option.value)
-            .and_then(|value| match value {
-                CommandDataOptionValue::String(value) => Some(value.as_str()),
-                _ => None,
-            })
-    })
-}
-
-fn parse_format(value: &str) -> Option<ArchiveFormat> {
-    match value {
-        "html" => Some(ArchiveFormat::Html),
-        "pdf" => Some(ArchiveFormat::Pdf),
-        _ => None,
-    }
 }
 
 async fn archive_channels(
@@ -1191,19 +1057,6 @@ fn write_html_image(
     )
 }
 
-async fn write_pdf(
-    path: &Path,
-    channel: &GuildChannel,
-    messages: Vec<ArchivedMessage>,
-) -> Result<(), BoxError> {
-    let path = path.to_owned();
-    let channel_name = channel.name.clone();
-    let channel_id = channel.id.get();
-    tokio::task::spawn_blocking(move || render_pdf(&path, &channel_name, channel_id, &messages))
-        .await??;
-    Ok(())
-}
-
 fn archived_resource_paths(messages: &[ArchivedMessage]) -> Vec<PathBuf> {
     messages
         .iter()
@@ -1234,201 +1087,6 @@ fn count_unavailable_resources(messages: &[ArchivedMessage]) -> usize {
                     .sum::<usize>()
         })
         .sum()
-}
-
-fn estimate_pdf_size(messages: &[ArchivedMessage]) -> u64 {
-    const EMBEDDED_FONT_AND_PDF_OVERHEAD: u64 = 4 * 1024 * 1024;
-    let mut estimate = EMBEDDED_FONT_AND_PDF_OVERHEAD;
-
-    for message in messages {
-        estimate = estimate.saturating_add(
-            (message.timestamp.len() + message.author.len() + message.content.len()) as u64 * 2,
-        );
-        for attachment in &message.attachments {
-            estimate = estimate.saturating_add(
-                (attachment.name.len()
-                    + attachment.url.len()
-                    + attachment
-                        .resource
-                        .as_ref()
-                        .map_or(0, |resource| resource.relative_path.len())) as u64
-                    * 2,
-            );
-        }
-        for embed in &message.embeds {
-            estimate = estimate.saturating_add(embed.summary.len() as u64 * 2);
-            for resource in &embed.resources {
-                estimate = estimate.saturating_add(resource.relative_path.len() as u64 * 2);
-            }
-        }
-    }
-
-    estimate
-}
-
-fn pdf_job_too_large(size: u64) -> bool {
-    size > MAX_PDF_JOB_SIZE
-}
-
-async fn remove_canceled_archive(output_dir: &Path) {
-    match tokio::fs::remove_dir_all(output_dir).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => eprintln!(
-            "Could not remove canceled PDF archive directory {}: {error}",
-            output_dir.display()
-        ),
-    }
-}
-
-fn render_pdf(
-    path: &Path,
-    channel_name: &str,
-    channel_id: u64,
-    messages: &[ArchivedMessage],
-) -> Result<(), BoxError> {
-    let font = load_pdf_font()?;
-    let family = fonts::FontFamily {
-        regular: font.clone(),
-        bold: font.clone(),
-        italic: font.clone(),
-        bold_italic: font,
-    };
-    let mut document = genpdf::Document::new(family);
-    document.set_title(format!("#{channel_name} Discord archive"));
-    document.set_font_size(10);
-    document.set_line_spacing(1.15);
-    document.set_page_decorator(DiscordPageDecorator);
-
-    document.push(
-        elements::Paragraph::new(format!("#{channel_name}")).styled(
-            style::Style::new()
-                .bold()
-                .with_font_size(20)
-                .with_color(pdf_text_colour()),
-        ),
-    );
-    document.push(
-        elements::Paragraph::new(format!(
-            "{} messages • channel ID {channel_id}",
-            messages.len()
-        ))
-        .styled(pdf_muted_colour()),
-    );
-    document.push(elements::Break::new(1.5));
-
-    for message in messages {
-        let edited = if message.edited { " (edited)" } else { "" };
-        let username_colour = message
-            .author_colour
-            .map(|(red, green, blue)| style::Color::Rgb(red, green, blue))
-            .unwrap_or_else(pdf_text_colour);
-        let line = elements::Paragraph::default()
-            .styled_string(format!("[{}] ", message.timestamp), pdf_muted_colour())
-            .styled_string(
-                format!("{}: ", message.author),
-                style::Style::new().bold().with_color(username_colour),
-            )
-            .styled_string(format!("{}{}", message.content, edited), pdf_text_colour());
-        document.push(line);
-        for attachment in &message.attachments {
-            let location = attachment
-                .resource
-                .as_ref()
-                .map(|resource| resource.relative_path.as_str())
-                .unwrap_or(&attachment.url);
-            document.push(
-                elements::Paragraph::new(format!(
-                    "Attachment: {name} ({:.2} MiB) — {location}",
-                    mib(u64::from(attachment.size)),
-                    name = attachment.name,
-                ))
-                .styled(pdf_muted_colour()),
-            );
-        }
-        for embed in &message.embeds {
-            document.push(
-                elements::Paragraph::new(format!("Embed: {}", embed.summary))
-                    .styled(pdf_muted_colour()),
-            );
-            for resource in &embed.resources {
-                document.push(
-                    elements::Paragraph::new(format!("Embed resource: {}", resource.relative_path))
-                        .styled(pdf_muted_colour()),
-                );
-            }
-            for url in &embed.unavailable_resources {
-                document.push(
-                    elements::Paragraph::new(format!(
-                        "Embed resource could not be archived — {url}"
-                    ))
-                    .styled(pdf_muted_colour()),
-                );
-            }
-        }
-        document.push(elements::Break::new(0.35));
-    }
-
-    document.render_to_file(path)?;
-    Ok(())
-}
-
-struct DiscordPageDecorator;
-
-impl genpdf::PageDecorator for DiscordPageDecorator {
-    fn decorate_page<'a>(
-        &mut self,
-        _context: &genpdf::Context,
-        mut area: genpdf::render::Area<'a>,
-        _style: style::Style,
-    ) -> Result<genpdf::render::Area<'a>, genpdf::error::Error> {
-        let size = area.size();
-        let width_mm: f64 = size.width.into();
-        let height_mm: f64 = size.height.into();
-        let background = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
-            1,
-            1,
-            image::Rgb([49, 51, 56]),
-        ));
-        area.add_image(
-            &background,
-            genpdf::Position::new(0, size.height),
-            genpdf::Scale::new(width_mm * 300.0 / 25.4, height_mm * 300.0 / 25.4),
-            genpdf::Rotation::default(),
-            Some(300.0),
-        );
-        area.add_margins(12);
-        Ok(area)
-    }
-}
-
-fn pdf_text_colour() -> style::Color {
-    style::Color::Rgb(219, 222, 225)
-}
-
-fn pdf_muted_colour() -> style::Color {
-    style::Color::Rgb(148, 155, 164)
-}
-
-fn load_pdf_font() -> Result<fonts::FontData, BoxError> {
-    let mut candidates = Vec::new();
-    if let Ok(path) = std::env::var("ARCHIVE_PDF_FONT") {
-        candidates.push(PathBuf::from(path));
-    }
-    candidates.extend([
-        PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-        PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-        PathBuf::from("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
-        PathBuf::from("/System/Library/Fonts/Supplemental/Arial.ttf"),
-        PathBuf::from("/Library/Fonts/Arial.ttf"),
-    ]);
-
-    for path in candidates {
-        if path.is_file() {
-            return Ok(fonts::FontData::load(path, None)?);
-        }
-    }
-    Err("No TrueType PDF font was found. Set ARCHIVE_PDF_FONT to a .ttf font file.".into())
 }
 
 fn archive_channel_basename(channel: &GuildChannel) -> String {
@@ -1508,19 +1166,6 @@ article{padding:4px 24px;break-inside:avoid}article:hover{background:#2e3035}.me
 mod tests {
     use super::*;
 
-    fn test_png() -> Vec<u8> {
-        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            2,
-            2,
-            image::Rgba([88, 101, 242, 128]),
-        ));
-        let mut output = std::io::Cursor::new(Vec::new());
-        image
-            .write_to(&mut output, image::ImageOutputFormat::Png)
-            .expect("test PNG should encode");
-        output.into_inner()
-    }
-
     #[test]
     fn escapes_html_content_and_attributes() {
         assert_eq!(html_escape("<&\"'>"), "&lt;&amp;&quot;&#39;&gt;");
@@ -1533,13 +1178,6 @@ mod tests {
         assert_eq!(channel_filename_prefix(ChannelType::Voice), "VC-");
         assert_eq!(channel_filename_prefix(ChannelType::Text), "");
         assert_eq!(channel_filename_prefix(ChannelType::News), "");
-    }
-
-    #[test]
-    fn parses_every_supported_format() {
-        assert_eq!(parse_format("html"), Some(ArchiveFormat::Html));
-        assert_eq!(parse_format("pdf"), Some(ArchiveFormat::Pdf));
-        assert_eq!(parse_format("txt"), None);
     }
 
     #[test]
@@ -1635,7 +1273,7 @@ mod tests {
         std::fs::create_dir_all(&asset_dir).expect("asset directory should exist");
         std::fs::write(&first, "general archive").expect("first archive should write");
         std::fs::write(&second, "random archive").expect("second archive should write");
-        std::fs::write(&image, test_png()).expect("image asset should write");
+        std::fs::write(&image, b"image asset fixture").expect("image asset should write");
         std::fs::write(&attachment, b"%PDF-test").expect("PDF attachment should write");
 
         write_zip(
@@ -1690,53 +1328,5 @@ mod tests {
         assert_eq!(unique_asset_filename("FOO.PDF", &mut used), "FOO_2.PDF");
         assert_eq!(unique_asset_filename("README", &mut used), "README");
         assert_eq!(unique_asset_filename("README", &mut used), "README_1");
-    }
-
-    #[test]
-    fn cancels_pdf_jobs_only_when_they_exceed_100_mib() {
-        assert!(!pdf_job_too_large(MAX_PDF_JOB_SIZE));
-        assert!(pdf_job_too_large(MAX_PDF_JOB_SIZE + 1));
-    }
-
-    #[test]
-    fn renders_a_pdf_when_a_supported_font_is_installed() {
-        if load_pdf_font().is_err() {
-            return;
-        }
-
-        let requested_path = std::env::var_os("ARCHIVE_TEST_PDF_PATH").map(PathBuf::from);
-        let path = requested_path.clone().unwrap_or_else(|| {
-            std::env::temp_dir().join(format!(
-                "frankenbot-archive-test-{}.pdf",
-                std::process::id()
-            ))
-        });
-        let messages = vec![ArchivedMessage {
-            id: 1,
-            timestamp: "2026.09.27-12:00:00".to_string(),
-            edited: false,
-            author: "Archive test".to_string(),
-            author_colour: Some((88, 101, 242)),
-            content: "Hello from Discord 👋".to_string(),
-            attachments: vec![ArchivedAttachment {
-                name: "test.png".to_string(),
-                url: "https://cdn.discordapp.com/test.png".to_string(),
-                size: test_png().len() as u32,
-                resource: Some(ArchivedResource {
-                    source_url: "https://cdn.discordapp.com/test.png".to_string(),
-                    relative_path: "assets/test.png".to_string(),
-                    local_path: PathBuf::from("assets/test.png"),
-                    is_image: true,
-                }),
-            }],
-            embeds: Vec::new(),
-        }];
-
-        render_pdf(&path, "general", 1, &messages).expect("PDF should render");
-        let data = std::fs::read(&path).expect("PDF should be readable");
-        assert!(data.starts_with(b"%PDF-"));
-        if requested_path.is_none() {
-            std::fs::remove_file(path).expect("test PDF should be removable");
-        }
     }
 }
