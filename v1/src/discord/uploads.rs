@@ -8,9 +8,8 @@ use serenity::{
 
 use crate::discord::replies::{
     personalized_put_response,
-    personalized_response,
-    reply_text,
-};
+    //personalized_response,
+    reply_text};
 
 const MAX_UPLOAD_SIZE: u64 = 24 * 1024 * 1024;
 
@@ -83,7 +82,7 @@ pub async fn reply_with_downloaded_files(
 
     if !attachments.is_empty() {
         let builder = CreateMessage::new()
-            .content(personalized_response(&msg.author.name, "Here you go!"))
+            .content(personalized_put_response(&msg.author.name))
             .reference_message(msg)
             .add_files(attachments);
 
